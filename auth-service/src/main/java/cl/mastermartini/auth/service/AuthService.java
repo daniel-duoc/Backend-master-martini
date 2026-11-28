@@ -1,9 +1,12 @@
 package cl.mastermartini.auth.service;
 
+import cl.mastermartini.auth.client.UsuariosClient;
 import cl.mastermartini.auth.dto.AuthResponse;
 import cl.mastermartini.auth.dto.LoginRequest;
 import cl.mastermartini.auth.dto.RegistroRequest;
+import cl.mastermartini.auth.dto.PerfilResponse;
 import cl.mastermartini.auth.model.Credencial;
+import cl.mastermartini.auth.model.EstadoRegistro;
 import cl.mastermartini.auth.repository.CredencialRepository;
 import cl.mastermartini.auth.security.JwtService;
 
@@ -17,85 +20,203 @@ import java.util.Locale;
 @Service
 public class AuthService {
 
-    private final CredencialRepository credenciales;
+    private final CredencialRepository repository;
     private final PasswordEncoder encoder;
-    private final JwtService jwt;
+    private final JwtService jwtService;
+    private final UsuariosClient usuariosClient;
+    private final RegistroTransaccionalService registroTransaccional;
 
     public AuthService(
-            CredencialRepository credenciales,
+            CredencialRepository repository,
             PasswordEncoder encoder,
-            JwtService jwt) {
-
-        this.credenciales = credenciales;
+            JwtService jwtService,
+            UsuariosClient usuariosClient,
+            RegistroTransaccionalService registroTransaccional
+    ) {
+        this.repository = repository;
         this.encoder = encoder;
-        this.jwt = jwt;
+        this.jwtService = jwtService;
+        this.usuariosClient = usuariosClient;
+        this.registroTransaccional = registroTransaccional;
     }
 
-    // Registrar una nueva cuenta
-    public AuthResponse registrar(RegistroRequest req) {
+    // Registrar un usuario o recuperar un registro pendiente
+    public AuthResponse registrar(RegistroRequest request) {
 
-        String correo = req.correo()
+        String correo = request.correo()
                 .trim()
                 .toLowerCase(Locale.ROOT);
 
-        // Comprobar si el correo ya existe
-        if (credenciales.existsByCorreo(correo)) {
-            throw new ResponseStatusException(
-                    HttpStatus.CONFLICT,
-                    "Ya existe una cuenta con ese correo");
-        }
+        String nombre = request.nombre().trim();
 
-        // Guardar las credenciales con la contraseña protegida
-        Credencial credencial = credenciales.save(
-                new Credencial(
+        // Buscar credenciales existentes
+        Credencial credencial = repository.findByCorreo(correo)
+                .orElse(null);
+
+        if (credencial != null) {
+
+            // Validar si el registro pendiente puede recuperarse
+            validarRegistroPendiente(
+                    credencial,
+                    request.password()
+            );
+
+        } else {
+
+            try {
+
+                // Crear credenciales pendientes
+                credencial = registroTransaccional.crearPendiente(
                         correo,
-                        encoder.encode(req.password())
-                )
-        );
-
-        // Generar el token JWT
-        String token = jwt.generarToken(
-                credencial.getId(),
-                credencial.getCorreo()
-        );
-
-        return new AuthResponse(
-                token,
-                req.nombre().trim(),
-                credencial.getCorreo()
-        );
-    }
-
-    // Iniciar sesión
-    public AuthResponse login(LoginRequest req) {
-
-        String correo = req.correo()
-                .trim()
-                .toLowerCase(Locale.ROOT);
-
-        // Buscar y validar las credenciales
-        Credencial credencial = credenciales
-                .findByCorreo(correo)
-                .filter(c -> encoder.matches(
-                        req.password(),
-                        c.getPasswordHash()))
-                .orElseThrow(() ->
-                        new ResponseStatusException(
-                                HttpStatus.UNAUTHORIZED,
-                                "Correo o contraseña incorrectos"
-                        )
+                        encoder.encode(request.password()),
+                        nombre
                 );
 
-        // Generar el token JWT
-        String token = jwt.generarToken(
+            } catch (ResponseStatusException e) {
+
+                // Propagar errores que no sean conflictos
+                if (e.getStatusCode().value() != 409) {
+                    throw e;
+                }
+
+                // Recuperar una posible insercion concurrente
+                credencial = repository.findByCorreo(correo)
+                        .orElseThrow(() -> e);
+
+                validarRegistroPendiente(
+                        credencial,
+                        request.password()
+                );
+            }
+        }
+
+        // Recuperar el nombre original del registro
+        nombre = credencial.getNombreRegistro();
+
+        // Crear o recuperar el perfil sin duplicarlo
+        usuariosClient.crearPerfil(
                 credencial.getId(),
-                credencial.getCorreo()
+                nombre,
+                correo
+        );
+
+        // Activar la cuenta despues de confirmar el perfil
+        registroTransaccional.activarRegistro(
+                credencial.getId()
+        );
+
+        // Generar JWT despues de confirmar la activacion
+        String token = jwtService.generarToken(
+                credencial.getId(),
+                correo
         );
 
         return new AuthResponse(
                 token,
-                "",
-                credencial.getCorreo()
+                nombre,
+                correo
+        );
+    }
+
+    // Validar que un registro pendiente pueda recuperarse
+    private void validarRegistroPendiente(
+            Credencial credencial,
+            String password
+    ) {
+
+        // Rechazar cuentas que ya fueron activadas
+        if (credencial.getEstadoRegistro()
+                != EstadoRegistro.PENDIENTE) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "El correo ya esta registrado"
+            );
+        }
+
+        // Verificar la contrasena original
+        if (!encoder.matches(
+                password,
+                credencial.getPasswordHash()
+        )) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "No se pudo completar el registro"
+            );
+        }
+
+        // Comprobar que existan los datos pendientes
+        if (credencial.getNombreRegistro() == null
+                || credencial.getNombreRegistro().isBlank()) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "El registro pendiente no contiene los datos necesarios"
+            );
+        }
+    }
+
+    // Iniciar sesion
+    public AuthResponse login(LoginRequest request) {
+
+        String correo = request.correo()
+                .trim()
+                .toLowerCase(Locale.ROOT);
+
+        // Buscar las credenciales del usuario
+        Credencial credencial = repository.findByCorreo(correo)
+                .orElseThrow(() -> new ResponseStatusException(
+                        HttpStatus.UNAUTHORIZED,
+                        "Credenciales incorrectas"
+                ));
+
+        // Verificar la contrasena
+        if (!encoder.matches(
+                request.password(),
+                credencial.getPasswordHash()
+        )) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.UNAUTHORIZED,
+                    "Credenciales incorrectas"
+            );
+        }
+
+        // Impedir el acceso a cuentas pendientes
+        if (credencial.getEstadoRegistro()
+                != EstadoRegistro.ACTIVO) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.CONFLICT,
+                    "El registro del usuario esta pendiente"
+            );
+        }
+
+        // Generar token JWT
+        String token = jwtService.generarToken(
+                credencial.getId(),
+                correo
+        );
+
+        // Consultar el perfil en usuarios-service
+        PerfilResponse perfil =
+                usuariosClient.obtenerPerfil(token);
+
+        // Comprobar que el perfil corresponde al usuario
+        if (!credencial.getId().equals(perfil.id())
+                || !correo.equals(perfil.correo())) {
+
+            throw new ResponseStatusException(
+                    HttpStatus.SERVICE_UNAVAILABLE,
+                    "Los datos del perfil no coinciden"
+            );
+        }
+
+        return new AuthResponse(
+                token,
+                perfil.nombre(),
+                correo
         );
     }
 }

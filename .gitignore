@@ -31,3 +31,28 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Seguridad - Master Martini ###
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.pem
+*.key
+
+### Variables de entorno ###
+.env
+.env.*
+!.env.example
+
+### Archivos compilados y respaldos ###
+*.jar
+*.jar.bak
+
+### Configuraciones locales ###
+application-local.properties
+application-local.yml
+application-local.yaml
+
+### Registros de ejecucion ###
+*.log
